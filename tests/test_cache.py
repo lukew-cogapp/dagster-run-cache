@@ -1,11 +1,12 @@
 from datetime import timedelta
 from pathlib import Path
 
+import polars as pl
 import pytest
 
-from dagster_run_cache import cache as cache_module
 from dagster_run_cache import content_key
-from dagster_run_cache.cache import RunCache
+from dagster_run_cache.utils import cache as cache_module
+from dagster_run_cache.utils.cache import RunCache
 
 
 @pytest.fixture
@@ -121,3 +122,70 @@ def test_content_key_changes_with_any_part() -> None:
     assert content_key("embed", "v1", "text") == content_key("embed", "v1", "text")
     assert content_key("embed", "v1", "text") != content_key("embed", "v2", "text")
     assert content_key("embed", "v1", "text").startswith("embed:")
+
+
+def _rows(*pairs: tuple[str, int]) -> pl.DataFrame:
+    return pl.DataFrame({"k": [p[0] for p in pairs], "v": [p[1] for p in pairs]})
+
+
+def test_missing_on_empty_table_returns_every_row(cache: RunCache) -> None:
+    """With no table stored yet, every row is a miss."""
+    frame = pl.DataFrame({"k": ["a", "b"]})
+    assert cache.missing("thing", frame, key="k").equals(frame)
+
+
+def test_store_then_missing_returns_only_new_rows(cache: RunCache) -> None:
+    """Stored keys stop being misses; unstored ones remain."""
+    cache.store("thing", _rows(("a", 1), ("b", 2)), key="k")
+    misses = cache.missing("thing", pl.DataFrame({"k": ["a", "b", "c"]}), key="k")
+    assert misses["k"].to_list() == ["c"]
+
+
+def test_fetch_joins_stored_columns(cache: RunCache) -> None:
+    """``fetch`` returns the frame with the stored columns joined on."""
+    cache.store("thing", _rows(("a", 1), ("b", 2)), key="k")
+    fetched = cache.fetch("thing", pl.DataFrame({"k": ["b", "a"]}), key="k").collect()
+    assert fetched.sort("k").to_dicts() == [{"k": "a", "v": 1}, {"k": "b", "v": 2}]
+
+
+def test_store_replaces_existing_keys_and_keeps_the_rest(cache: RunCache, tmp_path: Path) -> None:
+    """A second store overwrites shared keys, adds new ones and leaves the others."""
+    cache.store("thing", _rows(("a", 1), ("b", 2)), key="k")
+    cache.store("thing", _rows(("b", 20), ("c", 3)), key="k")
+    table = pl.read_parquet(tmp_path / "thing" / "table.parquet").sort("k")
+    assert table.to_dicts() == [{"k": "a", "v": 1}, {"k": "b", "v": 20}, {"k": "c", "v": 3}]
+
+
+def test_store_keeps_last_of_duplicate_keys(cache: RunCache) -> None:
+    """Duplicate keys within one store collapse to the last row."""
+    cache.store("thing", _rows(("a", 1), ("a", 2)), key="k")
+    assert cache.fetch("thing", pl.DataFrame({"k": ["a"]}), key="k").collect()["v"].to_list() == [2]
+
+
+def test_store_leaves_one_file_and_no_temp(cache: RunCache, tmp_path: Path) -> None:
+    """Repeated stores keep a single table file with no temp files beside it."""
+    cache.store("thing", _rows(("a", 1)), key="k")
+    cache.store("thing", _rows(("b", 2)), key="k")
+    assert [p.name for p in tmp_path.rglob("*") if p.is_file()] == ["table.parquet"]
+
+
+def test_store_rejects_changed_columns(cache: RunCache) -> None:
+    """Storing a different schema raises rather than mixing shapes in one table."""
+    cache.store("thing", _rows(("a", 1)), key="k")
+    with pytest.raises(ValueError, match="clear"):
+        cache.store("thing", pl.DataFrame({"k": ["b"], "other": [1.0]}), key="k")
+
+
+def test_clear_counts_and_removes_the_table(cache: RunCache) -> None:
+    """``clear`` removes table rows and per-key entries under the prefix together."""
+    cache.store("thing", _rows(("a", 1), ("b", 2)), key="k")
+    cache.set("thing:x", 1)
+    assert cache.clear("thing") == 3
+    assert cache.missing("thing", pl.DataFrame({"k": ["a"]}), key="k").height == 1
+
+
+def test_missing_counts_towards_stats(cache: RunCache) -> None:
+    """Rows found in the table count as hits, the rest as misses."""
+    cache.store("thing", _rows(("a", 1)), key="k")
+    cache.missing("thing", pl.DataFrame({"k": ["a", "b", "c"]}), key="k")
+    assert cache.take_stats() == {"cache_hits": 1, "cache_misses": 2}

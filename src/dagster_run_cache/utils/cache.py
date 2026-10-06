@@ -1,7 +1,9 @@
 """A Redis-style key-value cache that persists between Dagster runs.
 
-Each entry is its own file under ``base_dir``, with no shared index or database
-to lock, so the cache is safe on a network mount shared by one container per run.
+Two tiers share one directory. Per-key entries are one file each, with no shared
+index or database to lock, so they are safe on a network mount shared by one
+container per run. Table entries are one Parquet file per prefix, for bulk work
+where a file per key would mean thousands of small reads.
 """
 
 import hashlib
@@ -18,6 +20,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import dagster as dg
+import polars as pl
 from pydantic import PrivateAttr
 
 _MISSING = object()
@@ -37,8 +40,8 @@ class RunCache(dg.ConfigurableResource):  # type: ignore[type-arg]
     """Key-value cache shared by every run pointing at the same ``base_dir``.
 
     Keys follow the Redis ``prefix:rest`` convention, and each prefix is a
-    directory that ``clear`` removes as a unit. Values are pickled, so only the
-    pipeline should be able to write to ``base_dir``.
+    directory that ``clear`` removes as a unit. Per-key values are pickled, so
+    only the pipeline should be able to write to ``base_dir``.
     """
 
     base_dir: str = "output/cache"
@@ -117,11 +120,64 @@ class RunCache(dg.ConfigurableResource):  # type: ignore[type-arg]
         return True
 
     def clear(self, prefix: str) -> int:
-        """Remove every key under ``prefix``; returns how many there were."""
+        """Remove every entry under ``prefix``, both tiers; returns how many there were."""
         directory = Path(self.base_dir) / self._check_prefix(prefix)
         count = sum(1 for _ in directory.rglob("*.pkl"))
+        table = self._table_path(prefix)
+        if table.exists():
+            count += pl.scan_parquet(table).select(pl.len()).collect().item()
         shutil.rmtree(directory, ignore_errors=True)
         return count
+
+    def missing(self, prefix: str, frame: pl.LazyFrame | pl.DataFrame, key: str) -> pl.DataFrame:
+        """Return the rows of ``frame`` whose ``key`` is not in the ``prefix`` table.
+
+        Collected, since the misses are what goes to the expensive call. Counts towards ``take_stats``.
+        """
+        frame = frame.lazy()
+        table = self._table_path(prefix)
+        misses = frame if not table.exists() else frame.join(pl.scan_parquet(table).select(key), on=key, how="anti")
+        result = misses.collect()
+        total = frame.select(pl.len()).collect().item()
+        self._misses += result.height
+        self._hits += total - result.height
+        return result
+
+    def store(self, prefix: str, frame: pl.LazyFrame | pl.DataFrame, key: str) -> None:
+        """Add ``frame``'s rows to the ``prefix`` table, replacing rows that share a ``key``.
+
+        Rewrites the table: the old rows stream with the new into a temp file that
+        then replaces it, so memory stays bounded and readers never see half a file.
+        Two runs storing at once both succeed, but the later one drops the other's
+        new rows, which costs a recompute rather than a corrupt cache.
+        """
+        new = frame.lazy().unique(key, keep="last", maintain_order=True)
+        if new.select(pl.len()).collect().item() == 0:
+            return
+        table = self._table_path(prefix)
+        table.parent.mkdir(parents=True, exist_ok=True)
+
+        parts = [new]
+        if table.exists():
+            old = pl.scan_parquet(table)
+            if old.collect_schema() != new.collect_schema():
+                raise ValueError(
+                    f"Columns stored under {prefix!r} have changed; call clear({prefix!r}) to start the table afresh"
+                )
+            parts.insert(0, old.join(new.select(key), on=key, how="anti"))
+
+        fd, tmp = tempfile.mkstemp(dir=table.parent, suffix=".tmp")
+        os.close(fd)
+        try:
+            pl.concat(parts).sink_parquet(tmp)
+            os.replace(tmp, table)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
+
+    def fetch(self, prefix: str, frame: pl.LazyFrame | pl.DataFrame, key: str) -> pl.LazyFrame:
+        """Join the ``prefix`` table's columns onto ``frame`` by ``key``; rows not stored drop out."""
+        return frame.lazy().join(pl.scan_parquet(self._table_path(prefix)), on=key, how="inner")
 
     def take_stats(self) -> dict[str, int]:
         """Return hit and miss counts since the last call, then reset them."""
@@ -133,6 +189,9 @@ class RunCache(dg.ConfigurableResource):  # type: ignore[type-arg]
         if not _PREFIX.fullmatch(prefix):
             raise ValueError(f"Cache key prefix {prefix!r} must be letters, digits, '_', '.' or '-'")
         return prefix
+
+    def _table_path(self, prefix: str) -> Path:
+        return Path(self.base_dir) / self._check_prefix(prefix) / "table.parquet"
 
     def _path(self, key: str) -> Path:
         prefix = self._check_prefix(key.split(":", 1)[0]) if ":" in key else "_"

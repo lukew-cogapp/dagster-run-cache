@@ -1,7 +1,6 @@
 """Demo assets: one fake source and three ways of using ``RunCache`` against it."""
 
 import functools
-import itertools
 from datetime import timedelta
 
 import dagster as dg
@@ -11,6 +10,7 @@ from dagster_polars import PolarsParquetIOManager
 from dagster_run_cache import RunCache, content_key, fakes
 
 EMBED_BATCH_SIZE = 100
+VECTOR = pl.Array(pl.Float32, fakes.EMBED_DIM)
 # Re-analyse each image monthly even if its file date never changes.
 IMAGE_TTL = timedelta(days=30)
 
@@ -55,24 +55,25 @@ def doc_embeddings(
 ) -> pl.DataFrame:
     """One vector per document from a batched embedding endpoint.
 
-    Pattern: ``get_many``, send only the misses to the endpoint in batches, ``set_many`` the results.
-    The key hashes the model and the text, so an edit or a new model is a new key.
+    Pattern: the table tier. ``missing`` finds uncached rows in one join, only those go to the
+    endpoint, ``store`` adds them, and ``fetch`` joins every document to its vector. The key
+    hashes the model and the text, so an edit or a new model is a new key.
     """
     docs = documents.select("doc_id", text=pl.concat_str("title", "artist", "medium", separator=". ")).collect()
-    keys = [content_key("embed", config.model, text) for text in docs["text"]]
+    docs = docs.with_columns(cache_key=pl.Series([content_key("embed", config.model, t) for t in docs["text"]]))
 
-    vectors = cache.get_many(keys)
-    missing = {key: text for key, text in zip(keys, docs["text"], strict=True) if key not in vectors}
-    for batch in itertools.batched(missing.items(), EMBED_BATCH_SIZE, strict=False):
-        batch_keys, texts = zip(*batch, strict=True)
-        fresh = dict(zip(batch_keys, fakes.embed_endpoint(list(texts), config.model), strict=True))
-        cache.set_many(fresh)
-        vectors |= fresh
+    misses = cache.missing("embed", docs, key="cache_key")
+    vectors = []
+    for batch in misses.iter_slices(EMBED_BATCH_SIZE):
+        vectors += fakes.embed_endpoint(batch["text"].to_list(), config.model)
+    cache.store("embed", misses.select("cache_key", pl.Series("vector", vectors, dtype=VECTOR)), key="cache_key")
 
     context.add_output_metadata(cache.take_stats())
-    return docs.select(
-        "doc_id",
-        pl.Series("vector", [vectors[key] for key in keys], dtype=pl.Array(pl.Float32, fakes.EMBED_DIM)),
+    return (
+        cache.fetch("embed", docs.select("doc_id", "cache_key"), key="cache_key")
+        .select("doc_id", "vector")
+        .sort("doc_id")
+        .collect()
     )
 
 
