@@ -117,13 +117,13 @@ uv run dagster dev -m dagster_run_cache.defs
   misses streams the old rows and the new into a temp file that replaces the
   original: around 230MB for 150K 384-dimension vectors, seconds locally and
   up to half a minute on NFS. A run with no misses writes nothing.
-- **Concurrent stores.** Two runs storing to one prefix at once both succeed,
+- **Concurrent stores:** two runs storing to one prefix at once both succeed,
   but the later drops the other's new rows. That costs a recompute, never a
   corrupt file.
 - **Columns are fixed per prefix.** Storing different columns raises; call
   `clear(prefix)` to start afresh.
-- **No expiry.** Put whatever should trigger a refresh into the key.
-- **Rename atomicity on the mount.** Writes rely on `os.replace` being atomic,
+- **No expiry:** put whatever should trigger a refresh into the key.
+- **Rename atomicity on the mount:** writes rely on `os.replace` being atomic,
   which holds on local filesystems and NFS. Check it on any other mount type.
 - Polars is pinned below 2.0 until dagster-polars supports it.
 

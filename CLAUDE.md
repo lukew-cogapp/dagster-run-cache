@@ -39,11 +39,10 @@ venv's scripts hold absolute paths.
 
 ## Design decisions the user made
 
-These were argued through; don't reopen them without a reason the
-conversation didn't cover.
+These were argued through; don't reopen them without a new reason.
 
-- **Table only.** An earlier Redis-style per-key tier (`get`/`set`, a pickle
-  file per key) was removed: pipeline work arrives as frames, so a join beats a
+- **Table only:** an earlier Redis-style per-key tier (`get`/`set`, a pickle
+  file per key) was removed. Pipeline work arrives as frames, so a join beats a
   file read per key, and typed columns beat pickles.
 - **One file per prefix**, at `<base_dir>/<prefix>.parquet`, no subfolders.
   Not a directory of delta files: the user rejected that even though it avoids

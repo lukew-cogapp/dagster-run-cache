@@ -1,9 +1,6 @@
 """A cache of computed rows that persists between Dagster runs.
 
-Each prefix is one Parquet file under ``base_dir``, keyed by one or more
-columns. A lookup is a single scan and join, and a store rewrites the file
-through a temp file, so the cache works on a network mount shared by one
-container per run.
+Each prefix is one Parquet file under ``base_dir``, keyed by one or more columns.
 """
 
 import contextlib
@@ -72,8 +69,7 @@ class RunCache(dg.ConfigurableResource):  # type: ignore[type-arg]
     def store(self, prefix: str, frame: Frame, key: Key) -> None:
         """Add ``frame``'s rows under ``prefix``, replacing rows that share a key.
 
-        Rewrites the file: the old rows stream with the new into a temp file that
-        then replaces it, so memory stays bounded and readers never see half a file.
+        Rewrites the file, streaming the old rows with the new so memory stays bounded.
         Two runs storing at once both succeed, but the later one drops the other's
         new rows, which costs a recompute rather than a corrupt cache.
         """
