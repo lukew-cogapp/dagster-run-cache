@@ -5,8 +5,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 `RunCache`, a Dagster resource that caches computed rows between runs: one
-Parquet file per prefix, keyed by one or more columns, with `compute`,
-`missing`, `store`, `fetch`, `clear` and `take_stats`. Plus a demo pipeline
+Parquet file per table, keyed by one or more columns, with `compute`,
+`lookup`, `store`, `fetch` and `clear`. Plus a demo pipeline
 that exercises it. The README covers the API, key choice and limits; read it
 first.
 
@@ -44,26 +44,38 @@ These were argued through; don't reopen them without a new reason.
 - **Table only:** an earlier Redis-style per-key tier (`get`/`set`, a pickle
   file per key) was removed. Pipeline work arrives as frames, so a join beats a
   file read per key, and typed columns beat pickles.
-- **One file per prefix**, at `<base_dir>/<prefix>.parquet`, no subfolders.
+- **One file per table**, at `<base_dir>/<table>.parquet`, no subfolders.
   Not a directory of delta files: the user rejected that even though it avoids
   the rewrite.
 - **Keys are columns, not hashes.** No `content_key`; multi-column keys
   (`["model", "text"]`) carry every input that changes the result. No TTL:
   a refresh trigger goes in the key.
+- **Stats come back from each call**, not from counters on the resource:
+  `lookup` returns a `Lookup` whose `.metadata` holds `cache/<table>/hits` and
+  `cache/<table>/misses`, and `compute` returns `(LazyFrame, Lookup)`.
+- **Called "table", not "prefix"**, so it is not confused with a Dagster
+  asset-key prefix.
+- **Not yet done, by choice:** S3/UPath paths, an asset-check factory and
+  Pandera schemas. They block upstreaming into collection-flow, not this repo;
+  FAMSF reads S3 through an NFS mount.
 
 ## How it works
 
-- `store` collects the new rows (deduped on key, last wins), anti-joins the
-  old file against them, streams both into a temp file with `sink_parquet`, then
-  `os.replace`s it (`_atomic_write`). A changed column schema raises and points
-  at `clear`. Concurrent stores are last-writer-wins: lost rows cost a
-  recompute.
-- `missing` counts hits and misses on the resource (`PrivateAttr`); `fetch`
-  and `store` do not. Each demo asset ends with
-  `context.add_output_metadata(cache.take_stats())`, and `run_demo` reads
-  `cache_hits` / `cache_misses` back from that metadata.
-- `fetch` on a prefix with no file returns `frame.head(0)`, so `compute` on an
-  empty first run returns empty rather than raising.
+- `lookup` stays lazy until one `pl.collect_all` that returns the misses, the
+  distinct-key count and the key null counts together, so a lazy input plan
+  runs once. Hit and miss counts are distinct keys, not rows.
+- `compute` passes `fn` only the distinct uncached keys, checks the result
+  (key columns present, every key returned, no column clashing with the input
+  frame), and stores each `batch_size` slice as it finishes.
+- `store` dedupes the new rows on key (last wins), rejects null keys, aligns
+  them to the stored schema (column order, then a strict cast), anti-joins the
+  old file against them, streams both into a temp file with `sink_parquet`,
+  then `os.replace`s it (`_atomic_write`). Different column names or a failed
+  cast raise and point at `clear`. Concurrent stores are last-writer-wins.
+- `fetch` returns a `LazyFrame`; on a table with no file it returns
+  `frame.head(0)`, so `compute` on an empty first run returns empty.
+- Demo assets return `LazyFrame` for the IO manager to sink. `run_demo` maps
+  each asset to its table (`CACHE_TABLES`) to read the counts back.
 
 ## Demo scenario numbers
 

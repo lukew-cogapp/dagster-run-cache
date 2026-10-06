@@ -1,7 +1,7 @@
 [project]
 name = "dagster-run-cache"
 version = "0.1.0"
-description = "A Redis-style key-value cache that persists between Dagster runs"
+description = "A cache of computed rows that persists between Dagster runs"
 readme = "README.md"
 authors = [
     { name = "Luke Watson-Davies", email = "lukew@cogapp.com" }
