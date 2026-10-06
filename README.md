@@ -209,7 +209,7 @@ The cache directory after the runs holds one file per table: `embed.parquet`,
 To browse the assets in the Dagster UI instead:
 
 ```sh
-uv run dagster dev -m dagster_run_cache.defs
+uv run dg dev
 ```
 
 ## Limits

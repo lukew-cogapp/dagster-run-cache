@@ -14,7 +14,7 @@ it. The README covers the API, key choice and limits; read it first.
 ```sh
 uv sync
 uv run python scripts/demo.py                    # four runs, prints hits/misses per asset
-uv run dagster dev -m dagster_run_cache.defs     # UI (the user runs this, not Claude)
+uv run dg dev                                    # UI (the user runs this, not Claude)
 
 uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest   # the CI gate
 uv run pytest tests/test_cache.py::test_multi_column_key                          # one test
