@@ -1,0 +1,12 @@
+pre-commit:
+  parallel: true
+  jobs:
+    - name: ruff-format
+      glob: "*.py"
+      run: uv run ruff format --check {staged_files}
+    - name: ruff-check
+      glob: "*.py"
+      run: uv run ruff check {staged_files}
+    - name: mypy
+      glob: "*.py"
+      run: uv run mypy src

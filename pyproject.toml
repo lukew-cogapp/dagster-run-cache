@@ -1,0 +1,44 @@
+[project]
+name = "cached-compute-demo"
+version = "0.1.0"
+description = "Per-row result caching between Dagster runs, stored through the Parquet IO manager"
+readme = "README.md"
+authors = [
+    { name = "Luke Watson-Davies", email = "lukew@cogapp.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "dagster>=1.13.25",
+    "dagster-polars>=0.27.12",
+    "polars>=1.30,<2",
+    "polars-hash>=0.9.3",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.8,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "mypy>=2.4.0",
+    "pytest>=9.1.1",
+    "ruff>=0.16.10",
+]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "D"]
+ignore = ["D203", "D213"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D100"]
+"scripts/*" = ["D100"]
+
+[tool.mypy]
+strict = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
