@@ -28,6 +28,7 @@ Register it once in `Definitions` and request it by name in any asset:
 ```python
 defs = dg.Definitions(assets=[...], resources={"cache": RunCache(base_dir="output/cache")})
 
+
 @dg.asset
 def place_geocodes(cache: RunCache, documents: pl.LazyFrame) -> pl.DataFrame: ...
 ```
@@ -41,7 +42,7 @@ A short natural key reads best where one exists: `f"geocode:{place}"`.
 Where the inputs are long or several, `content_key` hashes them:
 
 ```python
-content_key("embed", model, text)   # "embed:9f2c…"
+content_key("embed", model, text)  # "embed:9f2c…"
 ```
 
 Any change to any part gives a new key, so invalidation needs no code: a

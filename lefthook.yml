@@ -2,7 +2,7 @@ pre-commit:
   parallel: true
   jobs:
     - name: ruff-format
-      glob: "*.py"
+      glob: "*.{py,md}"
       run: uv run ruff format --check {staged_files}
     - name: ruff-check
       glob: "*.py"
