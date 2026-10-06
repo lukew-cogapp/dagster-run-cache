@@ -1,7 +1,7 @@
 [project]
-name = "cached-compute-demo"
+name = "dagster-run-cache"
 version = "0.1.0"
-description = "Per-row result caching between Dagster runs, stored through the Parquet IO manager"
+description = "A Redis-style key-value cache that persists between Dagster runs"
 readme = "README.md"
 authors = [
     { name = "Luke Watson-Davies", email = "lukew@cogapp.com" }
@@ -11,7 +11,7 @@ dependencies = [
     "dagster>=1.13.25",
     "dagster-polars>=0.27.12",
     "polars>=1.30,<2",
-    "polars-hash>=0.9.3",
+    "pydantic>=2.13.5",
 ]
 
 [build-system]

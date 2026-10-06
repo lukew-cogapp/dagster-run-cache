@@ -1,7 +1,7 @@
-"""Run the pipeline four times against one storage dir and print what each cached asset saved.
+"""Run the pipeline four times against one storage dir and print what the cache saved for each asset.
 
 Each run uses a fresh ephemeral Dagster instance, so the only thing carried
-between runs is the Parquet on disk, as with a container-per-run deployment.
+between runs is the cache directory on disk, as with a container-per-run deployment.
 
     uv run python scripts/demo.py
 """
@@ -14,10 +14,11 @@ from pathlib import Path
 import dagster as dg
 from dagster_polars import PolarsParquetIOManager
 
-from cached_compute_demo.defs import ALL_ASSETS
+from dagster_run_cache import RunCache
+from dagster_run_cache.defs import ALL_ASSETS
 
 STORAGE = Path(__file__).resolve().parent.parent / "output"
-CACHED = ["doc_embeddings", "place_geocodes", "image_analysis"]
+CACHED = ["place_geocodes", "doc_embeddings", "image_analysis"]
 
 RUNS = [
     ("first run, empty cache", 1, "fake-embed-v1"),
@@ -37,7 +38,7 @@ def main() -> None:
         started = time.perf_counter()
         result = dg.materialize(
             ALL_ASSETS,
-            resources={"io_manager": io_manager},
+            resources={"io_manager": io_manager, "cache": RunCache(base_dir=str(STORAGE / "cache"))},
             run_config={
                 "ops": {
                     "documents": {"config": {"edition": edition}},

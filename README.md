@@ -1,104 +1,134 @@
-# dagster-cached-compute-demo
+# dagster-run-cache
 
-A helper that lets a Dagster asset recompute only the rows whose inputs changed
-since its last materialisation. Built for expensive per-row work such as
-embedding text or fetching documents.
+A Redis-style key-value cache for Dagster that persists between runs.
 
-The cache is the asset's own previous output, read back through its IO manager
-with `context.load_asset_value`. There is no separate cache store, so it works
-with one container per run and needs nothing beyond the Parquet the asset
-already writes.
+Assets call `get`, `set`, `has` and friends on a `RunCache` resource. Entries
+are files under a directory, one per key, so the cache survives one container
+per run and works on a shared network mount with nothing to lock.
 
-## How it works
-
-`cached_compute` (`src/cached_compute_demo/cached_compute.py`):
-
-1. Hashes each row's input columns plus a `version` string (polars-hash wyhash,
-   stable across Polars versions).
-2. Loads the asset's previous output. A first run has none.
-3. Keeps prior rows whose key and hash still match the current input.
-4. Calls `compute` in batches on the rest only.
-5. Returns kept and fresh rows together. Keys missing from the input drop out.
-
-Bump `version` to invalidate everything (a new model, a logic change).
+## API
 
 ```python
-@dg.asset
-def doc_embeddings(context, documents: pl.LazyFrame):
-    return cached_compute(
-        context,
-        documents,
-        key=["doc_id"],
-        inputs=["title"],
-        compute=lambda batch: batch.select("doc_id", embed(batch["title"])),
-        version="model-v1",
-    )
+from dagster_run_cache import RunCache, content_key
+
+cache.get("geocode:Tokyo", default=None)
+cache.set("geocode:Tokyo", (35.7, 139.7), ttl=timedelta(days=30))
+cache.has("geocode:Tokyo")
+cache.delete("geocode:Tokyo")
+cache.add("geocode:Tokyo", value)              # only if absent
+cache.get_or_set("geocode:Tokyo", lambda: geocode("Tokyo"))
+cache.get_many(keys)                           # hits only
+cache.set_many({key: value, ...})
+cache.clear("geocode")                         # every key under the prefix
+cache.take_stats()                             # {"cache_hits": n, "cache_misses": n}, then reset
 ```
+
+Register it once in `Definitions` and request it by name in any asset:
+
+```python
+defs = dg.Definitions(assets=[...], resources={"cache": RunCache(base_dir="output/cache")})
+
+@dg.asset
+def place_geocodes(cache: RunCache, documents: pl.LazyFrame) -> pl.DataFrame: ...
+```
+
+### Keys
+
+Keys follow the Redis `prefix:rest` convention. The prefix is a directory on
+disk, so `clear("embed")` drops every embedding and leaves the rest.
+
+A short natural key reads best where one exists: `f"geocode:{place}"`.
+Where the inputs are long or several, `content_key` hashes them:
+
+```python
+content_key("embed", model, text)   # "embed:9f2c…"
+```
+
+Any change to any part gives a new key, so invalidation needs no code: a
+retitled document or a new model simply misses.
+
+### Values
+
+Values are pickled and zlib-compressed, as Django's file cache does, so any
+Python value works: vectors, tuples, dicts holding dates. Two consequences:
+
+- Only the pipeline should be able to write to `base_dir`. Loading a pickle
+  can run code.
+- A class must still be importable when its value is read. An entry that no
+  longer unpickles reads as a miss and is recomputed.
 
 ## Demo
 
-Three assets share the one helper, each caching a different kind of expensive
-work against the same fake source (`src/cached_compute_demo/defs.py`):
+Three assets each show one usage pattern against the same fake source
+(`src/dagster_run_cache/defs.py`). The services in `fakes.py` sleep to stand
+in for latency.
 
-| Asset | Expensive call | Key | Recomputed when |
-|---|---|---|---|
-| `doc_embeddings` | batched embedding endpoint | `doc_id` | title, artist or medium changes, or the model version is bumped |
-| `place_geocodes` | geocoder, one call per place | place string | a new place appears; places shared by many documents are looked up once |
-| `image_analysis` | image decode | `file_name` | the file's `file_date` moves on (re-photographed) |
-
-The services are fakes in `fakes.py` that sleep to stand in for latency.
+| Asset | Pattern | Key |
+|---|---|---|
+| `place_geocodes` | `get_or_set` per item | `geocode:{place}` |
+| `doc_embeddings` | `get_many`, batch the misses to the endpoint, `set_many` | `content_key("embed", model, text)` |
+| `image_analysis` | `get`, compute on a miss, `set` with a TTL | `content_key("image", file_name, file_date)` |
 
 ```sh
 uv sync
 uv run python scripts/demo.py
 ```
 
-Four runs against one `output/` dir, each with a fresh ephemeral Dagster
-instance, so only the Parquet on disk carries over:
+Four runs, each on a fresh ephemeral Dagster instance, so only the cache
+directory carries over:
 
 ```
 Run 1: first run, empty cache…
-  doc_embeddings   hits     0  misses  1000
   place_geocodes   hits     0  misses    12
+  doc_embeddings   hits     0  misses  1000
   image_analysis   hits     0  misses  1000
-  total time       7.46s
+  total time       9.53s
 
 Run 2: nothing changed…
-  doc_embeddings   hits  1000  misses     0
   place_geocodes   hits    12  misses     0
+  doc_embeddings   hits  1000  misses     0
   image_analysis   hits  1000  misses     0
-  total time       0.30s
+  total time       0.23s
 
 Run 3: source edited: 10 retitled, 3 re-photographed, 5 deleted, 5 added in a new place…
-  doc_embeddings   hits   985  misses    15
   place_geocodes   hits    12  misses     1
+  doc_embeddings   hits   985  misses    15
   image_analysis   hits   992  misses     8
-  total time       0.42s
+  total time       0.34s
 
 Run 4: embedding model bumped…
-  doc_embeddings   hits     0  misses  1000
   place_geocodes   hits    13  misses     0
+  doc_embeddings   hits     0  misses  1000
   image_analysis   hits  1000  misses     0
-  total time       2.37s
+  total time       2.65s
 ```
 
 To browse the assets in the Dagster UI instead:
 
 ```sh
-uv run dagster dev -m cached_compute_demo.defs
+uv run dagster dev -m dagster_run_cache.defs
 ```
 
 ## Limits
 
-- The result is collected, not returned lazy. The kept rows are read from the
-  file the IO manager is about to overwrite, so they must be in memory first.
-  Peak memory is the size of the asset's output.
-- Misses are collected with their input columns. Keep `inputs` to the columns
-  that matter (the text to embed, not the whole document).
-- Results must fit Parquet columns. Vectors go in as `pl.Array(pl.Float32, n)`.
-- Each asset caches its own output. Two assets embedding the same text pay
-  twice; make the embeddings their own asset instead.
+- **Stale keys stay** until `clear()` or their TTL. An old model's
+  embeddings or a retitled document's old vector take disk space but are never
+  read again.
+- **One file per key.** A cold run over 150K keys writes 150K small files:
+  fine on local disk, slower on a network mount. Later runs only write what
+  changed.
+- **`add` is not atomic** across concurrent runs; both may store.
+- **Rename atomicity on the mount.** Writes rely on `os.replace` being atomic,
+  which holds on local filesystems and NFS. Check it on any other mount type.
 - Polars is pinned below 2.0 until dagster-polars supports it.
+
+## Why not a library
+
+`diskcache` has nearly this API but keeps its index in SQLite, whose locking
+is unreliable on NFS. `dogpile.cache`'s file backend is dbm, with the same
+problem, and its region setup adds more than it saves. `cachetools` is
+in-memory only. A Redis server would need running; if one appears, `redis-py`
+can sit behind the same `RunCache` methods without changing any asset.
 
 ## Development
 
