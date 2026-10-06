@@ -1,18 +1,15 @@
-"""Demo assets: one fake source and three ways of using ``RunCache`` against it."""
+"""Demo assets: one fake source and three expensive steps cached against it with ``RunCache``."""
 
-import functools
-from datetime import timedelta
+from pathlib import Path
 
 import dagster as dg
 import polars as pl
 from dagster_polars import PolarsParquetIOManager
 
-from dagster_run_cache import RunCache, content_key, fakes
+from dagster_run_cache import RunCache, fakes
 
 EMBED_BATCH_SIZE = 100
 VECTOR = pl.Array(pl.Float32, fakes.EMBED_DIM)
-# Re-analyse each image monthly even if its file date never changes.
-IMAGE_TTL = timedelta(days=30)
 
 
 class SourceConfig(dg.Config):
@@ -34,19 +31,19 @@ def documents(config: SourceConfig) -> pl.DataFrame:
     return fakes.fake_documents(config.edition, config.size)
 
 
+def _geocode(batch: pl.DataFrame) -> pl.DataFrame:
+    coords = [fakes.geocode_endpoint(place) for place in batch["place"]]
+    return batch.select("place").with_columns(
+        lat=pl.Series([c[0] for c in coords]), lon=pl.Series([c[1] for c in coords])
+    )
+
+
 @dg.asset
 def place_geocodes(context: dg.AssetExecutionContext, cache: RunCache, documents: pl.LazyFrame) -> pl.DataFrame:
-    """Coordinates per distinct place, each geocoded once ever.
-
-    Pattern: ``get_or_set`` with a readable natural key.
-    """
-    places = documents.select("place").unique().sort("place").collect()["place"].to_list()
-    coords = [
-        cache.get_or_set(f"geocode:{place}", functools.partial(fakes.geocode_endpoint, place)) for place in places
-    ]
-
+    """Coordinates per distinct place, each geocoded once ever."""
+    result = cache.compute("geocode", documents.select("place").unique(), key="place", fn=_geocode)
     context.add_output_metadata(cache.take_stats())
-    return pl.DataFrame({"place": places, "lat": [c[0] for c in coords], "lon": [c[1] for c in coords]})
+    return result
 
 
 @dg.asset
@@ -55,51 +52,42 @@ def doc_embeddings(
 ) -> pl.DataFrame:
     """One vector per document from a batched embedding endpoint.
 
-    Pattern: the table tier. ``missing`` finds uncached rows in one join, only those go to the
-    endpoint, ``store`` adds them, and ``fetch`` joins every document to its vector. The key
-    hashes the model and the text, so an edit or a new model is a new key.
+    Uses ``missing``, ``store`` and ``fetch`` directly rather than ``compute``, to control the
+    endpoint's batch size. The model is part of the key, so a new model misses everything.
     """
-    docs = documents.select("doc_id", text=pl.concat_str("title", "artist", "medium", separator=". ")).collect()
-    docs = docs.with_columns(cache_key=pl.Series([content_key("embed", config.model, t) for t in docs["text"]]))
+    docs = documents.select(
+        "doc_id",
+        model=pl.lit(config.model),
+        text=pl.concat_str("title", "artist", "medium", separator=". "),
+    )
+    key = ["model", "text"]
 
-    misses = cache.missing("embed", docs, key="cache_key")
+    misses = cache.missing("embed", docs, key=key).unique(key, maintain_order=True)
     vectors = []
     for batch in misses.iter_slices(EMBED_BATCH_SIZE):
         vectors += fakes.embed_endpoint(batch["text"].to_list(), config.model)
-    cache.store("embed", misses.select("cache_key", pl.Series("vector", vectors, dtype=VECTOR)), key="cache_key")
+    cache.store("embed", misses.select(*key, pl.Series("vector", vectors, dtype=VECTOR)), key=key)
 
     context.add_output_metadata(cache.take_stats())
-    return (
-        cache.fetch("embed", docs.select("doc_id", "cache_key"), key="cache_key")
-        .select("doc_id", "vector")
-        .sort("doc_id")
-        .collect()
-    )
+    return cache.fetch("embed", docs, key=key).select("doc_id", "vector").sort("doc_id").collect()
+
+
+def _analyse(batch: pl.DataFrame) -> pl.DataFrame:
+    results = [fakes.analyse_image(name, date) for name, date in batch.select("file_name", "file_date").iter_rows()]
+    return batch.select("file_name", "file_date").with_columns(pl.DataFrame(results))
 
 
 @dg.asset
 def image_analysis(context: dg.AssetExecutionContext, cache: RunCache, documents: pl.LazyFrame) -> pl.DataFrame:
-    """Dimensions and dominant colour per image file.
-
-    Pattern: plain cache-aside with ``get`` and ``set``, plus a TTL. The file date is part of
-    the key, so a re-photographed image is a new key.
-    """
-    files = documents.select("file_name", "file_date").unique().sort("file_name").collect()
-
-    rows = []
-    for file_name, file_date in files.iter_rows():
-        key = content_key("image", file_name, file_date)
-        result = cache.get(key)
-        if result is None:
-            result = fakes.analyse_image(file_name, file_date)
-            cache.set(key, result, ttl=IMAGE_TTL)
-        rows.append({"file_name": file_name, **result})
-
+    """Dimensions and dominant colour per image file, redone when the file date moves on."""
+    files = documents.select("file_name", "file_date").unique()
+    result = cache.compute("image", files, key=["file_name", "file_date"], fn=_analyse)
     context.add_output_metadata(cache.take_stats())
-    return pl.DataFrame(rows)
+    return result
 
 
 ALL_ASSETS = [documents, place_geocodes, doc_embeddings, image_analysis]
+CACHED_ASSETS = ["place_geocodes", "doc_embeddings", "image_analysis"]
 
 defs = dg.Definitions(
     assets=ALL_ASSETS,
@@ -108,3 +96,29 @@ defs = dg.Definitions(
         "cache": RunCache(base_dir="output/cache"),
     },
 )
+
+
+def run_demo(
+    storage: Path, edition: int = 1, model: str = "fake-embed-v1", size: int = 1_000
+) -> dict[str, tuple[int, int]]:
+    """Materialise every asset once against ``storage``; returns (hits, misses) per cached asset."""
+    result = dg.materialize(
+        ALL_ASSETS,
+        resources={
+            "io_manager": PolarsParquetIOManager(base_dir=str(storage)),
+            "cache": RunCache(base_dir=str(storage / "cache")),
+        },
+        run_config={
+            "ops": {
+                "documents": {"config": {"edition": edition, "size": size}},
+                "doc_embeddings": {"config": {"model": model}},
+            }
+        },
+    )
+    if not result.success:
+        raise RuntimeError("Demo run failed")
+    counts = {}
+    for asset in CACHED_ASSETS:
+        meta = result.asset_materializations_for_node(asset)[0].metadata
+        counts[asset] = (meta["cache_hits"].value, meta["cache_misses"].value)
+    return counts  # type: ignore[return-value]

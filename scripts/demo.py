@@ -7,18 +7,12 @@ between runs is the cache directory on disk, as with a container-per-run deploym
 """
 
 import shutil
-import sys
 import time
 from pathlib import Path
 
-import dagster as dg
-from dagster_polars import PolarsParquetIOManager
-
-from dagster_run_cache import RunCache
-from dagster_run_cache.defs import ALL_ASSETS
+from dagster_run_cache.defs import run_demo
 
 STORAGE = Path(__file__).resolve().parent.parent / "output"
-CACHED = ["place_geocodes", "doc_embeddings", "image_analysis"]
 
 RUNS = [
     ("first run, empty cache", 1, "fake-embed-v1"),
@@ -31,30 +25,12 @@ RUNS = [
 def main() -> None:
     """Wipe the storage dir, then materialise once per entry in ``RUNS``."""
     shutil.rmtree(STORAGE, ignore_errors=True)
-    io_manager = PolarsParquetIOManager(base_dir=str(STORAGE))
-
     for n, (label, edition, model) in enumerate(RUNS, start=1):
         print(f"\nRun {n}: {label}…", flush=True)
         started = time.perf_counter()
-        result = dg.materialize(
-            ALL_ASSETS,
-            resources={"io_manager": io_manager, "cache": RunCache(base_dir=str(STORAGE / "cache"))},
-            run_config={
-                "ops": {
-                    "documents": {"config": {"edition": edition}},
-                    "doc_embeddings": {"config": {"model": model}},
-                }
-            },
-        )
-        if not result.success:
-            sys.exit(f"Run {n} failed")
-        for asset in CACHED:
-            meta = result.asset_materializations_for_node(asset)[0].metadata
-            print(
-                f"  {asset:<16} hits {meta['cache_hits'].value:>5}  misses {meta['cache_misses'].value:>5}",
-                flush=True,
-            )
-        print(f"  {'total time':<16} {time.perf_counter() - started:.2f}s", flush=True)
+        for asset, (hits, misses) in run_demo(STORAGE, edition=edition, model=model).items():
+            print(f"  {asset:<16} hits {hits:>5}  misses {misses:>5}", flush=True)
+        print(f"  total time       {time.perf_counter() - started:.2f}s", flush=True)
 
 
 if __name__ == "__main__":

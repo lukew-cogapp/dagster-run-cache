@@ -1,183 +1,112 @@
-"""A Redis-style key-value cache that persists between Dagster runs.
+"""A cache of computed rows that persists between Dagster runs.
 
-Two tiers share one directory. Per-key entries are one file each, with no shared
-index or database to lock, so they are safe on a network mount shared by one
-container per run. Table entries are one Parquet file per prefix, for bulk work
-where a file per key would mean thousands of small reads.
+Each prefix is one Parquet file under ``base_dir``, keyed by one or more
+columns. A lookup is a single scan and join, and a store rewrites the file
+through a temp file, so the cache works on a network mount shared by one
+container per run.
 """
 
-import hashlib
+import contextlib
 import os
-import pickle
 import re
-import shutil
 import tempfile
-import time
-import zlib
-from collections.abc import Callable, Iterable, Mapping
-from datetime import timedelta
+from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any, cast
 
 import dagster as dg
 import polars as pl
 from pydantic import PrivateAttr
 
-_MISSING = object()
+type Frame = pl.LazyFrame | pl.DataFrame
+type Key = str | list[str]
+
 _PREFIX = re.compile(r"[\w.-]+")
 
 
-def _now() -> float:
-    return time.time()
-
-
-def content_key(prefix: str, *parts: object) -> str:
-    """Build ``prefix:<sha256 of parts>``, so changing any part gives a new key."""
-    return f"{prefix}:{hashlib.sha256(repr(parts).encode()).hexdigest()}"
+@contextlib.contextmanager
+def _atomic_write(path: Path) -> Iterator[str]:
+    """Yield a temp path beside ``path`` that replaces it on success, so a reader never sees half a file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    os.close(fd)
+    try:
+        yield tmp
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
 
 
 class RunCache(dg.ConfigurableResource):  # type: ignore[type-arg]
-    """Key-value cache shared by every run pointing at the same ``base_dir``.
-
-    Keys follow the Redis ``prefix:rest`` convention, and each prefix is a
-    directory that ``clear`` removes as a unit. Per-key values are pickled, so
-    only the pipeline should be able to write to ``base_dir``.
-    """
+    """Computed rows shared by every run pointing at the same ``base_dir``, one file per prefix."""
 
     base_dir: str = "output/cache"
 
     _hits: int = PrivateAttr(default=0)
     _misses: int = PrivateAttr(default=0)
 
-    def get(self, key: str, default: Any = None) -> Any:
-        """Return the value for ``key``, or ``default`` if absent or expired."""
-        value = self._read(key)
-        if value is _MISSING:
-            self._misses += 1
-            return default
-        self._hits += 1
-        return value
+    def compute(self, prefix: str, frame: Frame, key: Key, fn: Callable[[pl.DataFrame], pl.DataFrame]) -> pl.DataFrame:
+        """Return ``frame`` joined to its cached columns, calling ``fn`` only for keys not cached yet.
 
-    def get_many(self, keys: Iterable[str]) -> dict[str, Any]:
-        """Return the keys that are present, like ``MGET`` with the misses left out."""
-        found = {}
-        for key in keys:
-            value = self.get(key, _MISSING)
-            if value is not _MISSING:
-                found[key] = value
-        return found
-
-    def get_or_set[T](self, key: str, factory: Callable[[], T], ttl: timedelta | None = None) -> T:
-        """Return the cached value, or call ``factory``, store its result and return that."""
-        value = self.get(key, _MISSING)
-        if value is _MISSING:
-            value = factory()
-            self.set(key, value, ttl)
-        return cast(T, value)
-
-    def has(self, key: str) -> bool:
-        """Check presence without loading the value."""
-        try:
-            with self._path(key).open("rb") as f:
-                expires_at = pickle.load(f)
-        except Exception:
-            return False
-        return expires_at is None or expires_at > _now()
-
-    def set(self, key: str, value: Any, ttl: timedelta | None = None) -> None:
-        """Store ``value`` under ``key``, replacing any existing entry."""
-        path = self._path(key)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        expires_at = _now() + ttl.total_seconds() if ttl else None
-        # Written beside the target and renamed over it, so a reader never sees half an entry.
-        fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
-        with os.fdopen(fd, "wb") as f:
-            pickle.dump(expires_at, f)
-            f.write(zlib.compress(pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)))
-        os.replace(tmp, path)
-
-    def set_many(self, items: Mapping[str, Any], ttl: timedelta | None = None) -> None:
-        """Store every key/value pair in ``items``."""
-        for key, value in items.items():
-            self.set(key, value, ttl)
-
-    def add(self, key: str, value: Any, ttl: timedelta | None = None) -> bool:
-        """Store ``value`` only if ``key`` is absent; returns whether it was stored.
-
-        Not atomic: two runs adding the same key at once may both succeed.
+        ``fn`` gets the uncached rows, one per key, and returns the key columns plus the values to cache.
         """
-        if self.has(key):
-            return False
-        self.set(key, value, ttl)
-        return True
+        misses = self.missing(prefix, frame, key)
+        if not misses.is_empty():
+            self.store(prefix, fn(misses.unique(key, maintain_order=True)), key)
+        return self.fetch(prefix, frame, key).collect()
 
-    def delete(self, key: str) -> bool:
-        """Remove ``key``; returns whether it existed."""
-        try:
-            self._path(key).unlink()
-        except FileNotFoundError:
-            return False
-        return True
-
-    def clear(self, prefix: str) -> int:
-        """Remove every entry under ``prefix``, both tiers; returns how many there were."""
-        directory = Path(self.base_dir) / self._check_prefix(prefix)
-        count = sum(1 for _ in directory.rglob("*.pkl"))
-        table = self._table_path(prefix)
-        if table.exists():
-            count += pl.scan_parquet(table).select(pl.len()).collect().item()
-        shutil.rmtree(directory, ignore_errors=True)
-        return count
-
-    def missing(self, prefix: str, frame: pl.LazyFrame | pl.DataFrame, key: str) -> pl.DataFrame:
-        """Return the rows of ``frame`` whose ``key`` is not in the ``prefix`` table.
+    def missing(self, prefix: str, frame: Frame, key: Key) -> pl.DataFrame:
+        """Return the rows of ``frame`` whose key is not cached under ``prefix``.
 
         Collected, since the misses are what goes to the expensive call. Counts towards ``take_stats``.
         """
-        frame = frame.lazy()
-        table = self._table_path(prefix)
-        misses = frame if not table.exists() else frame.join(pl.scan_parquet(table).select(key), on=key, how="anti")
-        result = misses.collect()
-        total = frame.select(pl.len()).collect().item()
-        self._misses += result.height
-        self._hits += total - result.height
-        return result
+        rows = frame.lazy().collect()
+        misses = rows
+        path = self._path(prefix)
+        if path.exists():
+            misses = rows.lazy().join(pl.scan_parquet(path).select(key), on=key, how="anti").collect()
+        self._misses += misses.height
+        self._hits += rows.height - misses.height
+        return misses
 
-    def store(self, prefix: str, frame: pl.LazyFrame | pl.DataFrame, key: str) -> None:
-        """Add ``frame``'s rows to the ``prefix`` table, replacing rows that share a ``key``.
+    def store(self, prefix: str, frame: Frame, key: Key) -> None:
+        """Add ``frame``'s rows under ``prefix``, replacing rows that share a key.
 
-        Rewrites the table: the old rows stream with the new into a temp file that
+        Rewrites the file: the old rows stream with the new into a temp file that
         then replaces it, so memory stays bounded and readers never see half a file.
         Two runs storing at once both succeed, but the later one drops the other's
         new rows, which costs a recompute rather than a corrupt cache.
         """
-        new = frame.lazy().unique(key, keep="last", maintain_order=True)
-        if new.select(pl.len()).collect().item() == 0:
+        new = frame.lazy().unique(key, keep="last", maintain_order=True).collect()
+        if new.is_empty():
             return
-        table = self._table_path(prefix)
-        table.parent.mkdir(parents=True, exist_ok=True)
-
-        parts = [new]
-        if table.exists():
-            old = pl.scan_parquet(table)
-            if old.collect_schema() != new.collect_schema():
+        path = self._path(prefix)
+        rows = new.lazy()
+        if path.exists():
+            old = pl.scan_parquet(path)
+            if old.collect_schema() != new.schema:
                 raise ValueError(
-                    f"Columns stored under {prefix!r} have changed; call clear({prefix!r}) to start the table afresh"
+                    f"Columns stored under {prefix!r} have changed; call clear({prefix!r}) to start afresh"
                 )
-            parts.insert(0, old.join(new.select(key), on=key, how="anti"))
+            rows = pl.concat([old.join(rows.select(key), on=key, how="anti"), rows])
+        with _atomic_write(path) as tmp:
+            rows.sink_parquet(tmp)
 
-        fd, tmp = tempfile.mkstemp(dir=table.parent, suffix=".tmp")
-        os.close(fd)
-        try:
-            pl.concat(parts).sink_parquet(tmp)
-            os.replace(tmp, table)
-        except BaseException:
-            Path(tmp).unlink(missing_ok=True)
-            raise
+    def fetch(self, prefix: str, frame: Frame, key: Key) -> pl.LazyFrame:
+        """Join the columns cached under ``prefix`` onto ``frame`` by key; rows not cached drop out."""
+        path = self._path(prefix)
+        if not path.exists():
+            return frame.lazy().head(0)
+        return frame.lazy().join(pl.scan_parquet(path), on=key, how="inner")
 
-    def fetch(self, prefix: str, frame: pl.LazyFrame | pl.DataFrame, key: str) -> pl.LazyFrame:
-        """Join the ``prefix`` table's columns onto ``frame`` by ``key``; rows not stored drop out."""
-        return frame.lazy().join(pl.scan_parquet(self._table_path(prefix)), on=key, how="inner")
+    def clear(self, prefix: str) -> int:
+        """Remove everything cached under ``prefix``; returns how many rows there were."""
+        path = self._path(prefix)
+        if not path.exists():
+            return 0
+        count: int = pl.scan_parquet(path).select(pl.len()).collect().item()
+        path.unlink()
+        return count
 
     def take_stats(self) -> dict[str, int]:
         """Return hit and miss counts since the last call, then reset them."""
@@ -185,30 +114,7 @@ class RunCache(dg.ConfigurableResource):  # type: ignore[type-arg]
         self._hits = self._misses = 0
         return stats
 
-    def _check_prefix(self, prefix: str) -> str:
+    def _path(self, prefix: str) -> Path:
         if not _PREFIX.fullmatch(prefix):
-            raise ValueError(f"Cache key prefix {prefix!r} must be letters, digits, '_', '.' or '-'")
-        return prefix
-
-    def _table_path(self, prefix: str) -> Path:
-        return Path(self.base_dir) / self._check_prefix(prefix) / "table.parquet"
-
-    def _path(self, key: str) -> Path:
-        prefix = self._check_prefix(key.split(":", 1)[0]) if ":" in key else "_"
-        digest = hashlib.sha256(key.encode()).hexdigest()
-        return Path(self.base_dir) / prefix / digest[:2] / f"{digest}.pkl"
-
-    def _read(self, key: str) -> Any:
-        path = self._path(key)
-        try:
-            with path.open("rb") as f:
-                expires_at = pickle.load(f)
-                if expires_at is not None and expires_at <= _now():
-                    path.unlink(missing_ok=True)
-                    return _MISSING
-                return pickle.loads(zlib.decompress(f.read()))
-        except FileNotFoundError:
-            return _MISSING
-        except Exception:
-            # Truncated, corrupt, or pickled from a class that has since moved: recompute rather than fail the run.
-            return _MISSING
+            raise ValueError(f"Cache prefix {prefix!r} must be letters, digits, '_', '.' or '-'")
+        return Path(self.base_dir) / f"{prefix}.parquet"

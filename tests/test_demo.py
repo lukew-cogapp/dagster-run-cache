@@ -1,36 +1,13 @@
 from pathlib import Path
 
-import dagster as dg
 import polars as pl
-from dagster_polars import PolarsParquetIOManager
 
-from dagster_run_cache import RunCache
-from dagster_run_cache.defs import ALL_ASSETS
+from dagster_run_cache.defs import run_demo
 from dagster_run_cache.fakes import fake_documents
-
-CACHED = ["place_geocodes", "doc_embeddings", "image_analysis"]
 
 
 def _run(storage: Path, edition: int = 1, model: str = "v1") -> dict[str, tuple[int, int]]:
-    result = dg.materialize(
-        ALL_ASSETS,
-        resources={
-            "io_manager": PolarsParquetIOManager(base_dir=str(storage)),
-            "cache": RunCache(base_dir=str(storage / "cache")),
-        },
-        run_config={
-            "ops": {
-                "documents": {"config": {"edition": edition, "size": 100}},
-                "doc_embeddings": {"config": {"model": model}},
-            }
-        },
-    )
-    assert result.success
-    counts = {}
-    for asset in CACHED:
-        meta = result.asset_materializations_for_node(asset)[0].metadata
-        counts[asset] = (meta["cache_hits"].value, meta["cache_misses"].value)
-    return counts  # type: ignore[return-value]
+    return run_demo(storage, edition=edition, model=model, size=100)
 
 
 def _embeddings(storage: Path) -> pl.DataFrame:

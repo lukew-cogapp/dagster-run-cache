@@ -4,12 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`RunCache`, a Dagster resource that persists between Dagster runs, with two
-tiers: a Redis-style per-key API (`get`, `set`, `has`, `delete`, `add`,
-`get_or_set`, `get_many`, `set_many`) and a Parquet table API for bulk work
-(`missing`, `store`, `fetch`). Both share `clear` and `take_stats`. Plus a demo
-pipeline that exercises it. The README covers the API, key convention and
-limits; read it first.
+`RunCache`, a Dagster resource that caches computed rows between runs: one
+Parquet file per prefix, keyed by one or more columns, with `compute`,
+`missing`, `store`, `fetch`, `clear` and `take_stats`. Plus a demo pipeline
+that exercises it. The README covers the API, key choice and limits; read it
+first.
 
 ## Commands
 
@@ -19,62 +18,53 @@ uv run python scripts/demo.py                    # four runs, prints hits/misses
 uv run dagster dev -m dagster_run_cache.defs     # UI (the user runs this, not Claude)
 
 uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest   # the CI gate
-uv run pytest tests/test_cache.py::test_ttl_expires_entries                       # one test
+uv run pytest tests/test_cache.py::test_multi_column_key                          # one test
 ```
 
 `ruff format` also formats Python code blocks inside `README.md`, and CI checks
 that. The lefthook format job globs `*.{py,md}` for this reason; run the
 formatter after any README edit.
 
+After renaming or moving the repo directory, `rm -rf .venv && uv sync`: the
+venv's scripts hold absolute paths.
+
 ## Layout
 
 - `src/dagster_run_cache/utils/cache.py`: the reusable part. No demo code
-  belongs under `utils/`. The package root re-exports `RunCache` and
-  `content_key`.
+  belongs under `utils/`. The package root re-exports `RunCache`.
 - `src/dagster_run_cache/fakes.py`: fake source (`fake_documents(edition, size)`)
   and fake slow endpoints that sleep to stand in for latency.
-- `src/dagster_run_cache/defs.py`: three assets, each showing one usage
-  pattern (per-key `get_or_set`, the table tier with batched misses, plain
-  `get`/`set` with a TTL), and the `Definitions`.
-- `tests/test_cache.py` unit-tests the resource; `tests/test_demo.py` runs the
-  four-run scenario through `dg.materialize` and asserts hit/miss counts.
+- `src/dagster_run_cache/defs.py`: the three demo assets, the `Definitions`,
+  and `run_demo`, which both `scripts/demo.py` and `tests/test_demo.py` call.
 
-## How the cache works
+## Design decisions the user made
 
-Per-key tier:
+These were argued through; don't reopen them without a reason the
+conversation didn't cover.
 
-- One file per key at `<base_dir>/<prefix>/<sha256[:2]>/<sha256>.pkl`, where
-  `prefix` is the part of the key before the first `:` (`_` if none). No shared
-  index or database, so it is safe on an NFS mount with concurrent runs. Keep it
-  that way: a SQLite- or dbm-backed store (diskcache, dogpile's dbm) was
-  rejected for NFS locking.
-- File format: a pickled `expires_at` (float or `None`) followed by the
-  zlib-compressed pickled value. `has` reads only the first pickle. Writes go to
-  a temp file in the same directory, then `os.replace`.
-- Any unreadable entry (missing, expired, corrupt, class moved) is a miss, never
-  an error.
+- **Table only.** An earlier Redis-style per-key tier (`get`/`set`, a pickle
+  file per key) was removed: pipeline work arrives as frames, so a join beats a
+  file read per key, and typed columns beat pickles.
+- **One file per prefix**, at `<base_dir>/<prefix>.parquet`, no subfolders.
+  Not a directory of delta files: the user rejected that even though it avoids
+  the rewrite.
+- **Keys are columns, not hashes.** No `content_key`; multi-column keys
+  (`["model", "text"]`) carry every input that changes the result. No TTL:
+  a refresh trigger goes in the key.
 
-Table tier:
+## How it works
 
-- One Parquet file per prefix at `<base_dir>/<prefix>/table.parquet`, inside
-  the prefix directory so `clear(prefix)` removes it with the per-key entries.
-- A Parquet file cannot be appended to, so `store` streams the old rows (minus
-  replaced keys) and the new rows into a temp file with `sink_parquet`, then
-  `os.replace`s it. The user wants a single file per prefix, not a directory
-  of delta files; don't reintroduce one.
-- Concurrent stores are last-writer-wins: the loser's new rows are dropped,
-  costing a recompute. A changed column schema raises and points at `clear`.
-
-Both tiers:
-
-- Invalidation is by key, not by version flags: `content_key(prefix, *parts)`
-  hashes the inputs, so changed inputs produce a new key and old entries go
-  stale until `clear(prefix)` or TTL.
-- Hit/miss counters live on the resource (`PrivateAttr`). Each demo asset calls
-  `context.add_output_metadata(cache.take_stats())` at the end, and the demo and
-  tests read `cache_hits` / `cache_misses` from that metadata. `get`-based reads
-  and `missing` count; `has` and `fetch` do not.
-- Time goes through `utils.cache._now()` so tests can monkeypatch the clock.
+- `store` collects the new rows (deduped on key, last wins), anti-joins the
+  old file against them, streams both into a temp file with `sink_parquet`, then
+  `os.replace`s it (`_atomic_write`). A changed column schema raises and points
+  at `clear`. Concurrent stores are last-writer-wins: lost rows cost a
+  recompute.
+- `missing` counts hits and misses on the resource (`PrivateAttr`); `fetch`
+  and `store` do not. Each demo asset ends with
+  `context.add_output_metadata(cache.take_stats())`, and `run_demo` reads
+  `cache_hits` / `cache_misses` back from that metadata.
+- `fetch` on a prefix with no file returns `frame.head(0)`, so `compute` on an
+  empty first run returns empty rather than raising.
 
 ## Demo scenario numbers
 
@@ -85,7 +75,7 @@ and the README output block together.
 
 ## Constraints
 
-- Python 3.14 (`.python-version`); PEP 695 generics are used (`get_or_set[T]`).
+- Python 3.14 (`.python-version`); PEP 695 `type` aliases are used.
 - Polars is pinned `<2`: dagster-polars still passes `rechunk` to
   `scan_parquet`, which Polars 2.0 removed. Lift the pin once dagster-polars
   supports Polars 2.
