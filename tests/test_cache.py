@@ -188,3 +188,11 @@ def test_unsafe_table_name_is_rejected(cache: RunCache) -> None:
     """A table name that could escape ``base_dir`` raises."""
     with pytest.raises(ValueError):
         cache.lookup("../escape", pl.DataFrame({"k": ["a"]}), key="k")
+
+
+def test_key_missing_an_input_does_not_see_its_changes(cache: RunCache) -> None:
+    """A key that leaves out an input (here the text) hits on an edited row and returns its old value."""
+    cache.store("thing", pl.DataFrame({"id": [1], "v": ["old"]}), key="id")
+    edited = pl.DataFrame({"id": [1], "text": ["new"]})
+    assert cache.lookup("thing", edited, key="id").miss_count == 0
+    assert cache.fetch("thing", edited, key="id").collect()["v"].to_list() == ["old"]

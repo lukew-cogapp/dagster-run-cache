@@ -46,29 +46,55 @@ def place_geocodes(context: dg.AssetExecutionContext, cache: RunCache, documents
     return result
 
 
+def _embed(batch: pl.DataFrame) -> pl.DataFrame:
+    vectors = fakes.embed_endpoint(batch["text"].to_list(), batch["model"][0])
+    return batch.with_columns(pl.Series("vector", vectors, dtype=VECTOR))
+
+
+def _embedding_text(documents: pl.LazyFrame, model: str) -> pl.LazyFrame:
+    return documents.select(
+        "doc_id",
+        "modified",
+        model=pl.lit(model),
+        text=pl.concat_str("title", "artist", "medium", separator=". "),
+    )
+
+
 @dg.asset
 def doc_embeddings(
     context: dg.AssetExecutionContext, config: EmbedConfig, cache: RunCache, documents: pl.LazyFrame
 ) -> pl.LazyFrame:
-    """One vector per document from a batched embedding endpoint.
+    """One vector per document from a batched embedding endpoint, keyed on the text itself.
 
-    Uses ``lookup``, ``store`` and ``fetch`` directly rather than ``compute``, to show the steps
-    ``compute`` runs. The model is part of the key, so a new model misses everything.
+    The key holds every input to the embedding, so ``fn`` needs nothing beyond the key and
+    ``compute`` does the whole job. A new model misses everything.
     """
-    docs = documents.select(
-        "doc_id",
-        model=pl.lit(config.model),
-        text=pl.concat_str("title", "artist", "medium", separator=". "),
-    )
-    key = ["model", "text"]
+    docs = _embedding_text(documents, config.model)
+    result, lookup = cache.compute("embed", docs, key=["model", "text"], fn=_embed, batch_size=EMBED_BATCH_SIZE)
+    context.add_output_metadata(lookup.metadata)
+    return result.select("doc_id", "vector").sort("doc_id")
 
-    lookup = cache.lookup("embed", docs, key=key)
-    for batch in lookup.misses.select(key).unique(maintain_order=True).iter_slices(EMBED_BATCH_SIZE):
-        vectors = fakes.embed_endpoint(batch["text"].to_list(), config.model)
-        cache.store("embed", batch.with_columns(pl.Series("vector", vectors, dtype=VECTOR)), key=key)
+
+@dg.asset
+def doc_embeddings_by_id(
+    context: dg.AssetExecutionContext, config: EmbedConfig, cache: RunCache, documents: pl.LazyFrame
+) -> pl.LazyFrame:
+    """Embed each document as ``doc_embeddings`` does, keyed on the record instead of its text.
+
+    ``doc_id`` alone never changes, so an edited record would keep its old vector; ``modified``
+    is what moves when the record is edited. The text is not in the key, but the endpoint needs
+    it, so this uses ``lookup``, ``store`` and ``fetch``: the misses carry every column, and only
+    the key and vector are stored.
+    """
+    docs = _embedding_text(documents, config.model)
+    key = ["model", "doc_id", "modified"]
+
+    lookup = cache.lookup("embed_by_id", docs, key=key)
+    for batch in lookup.misses.iter_slices(EMBED_BATCH_SIZE):
+        cache.store("embed_by_id", _embed(batch).select(*key, "vector"), key=key)
 
     context.add_output_metadata(lookup.metadata)
-    return cache.fetch("embed", docs, key=key).select("doc_id", "vector").sort("doc_id")
+    return cache.fetch("embed_by_id", docs.select(key), key=key).select("doc_id", "vector").sort("doc_id")
 
 
 def _analyse(batch: pl.DataFrame) -> pl.DataFrame:
@@ -85,8 +111,13 @@ def image_analysis(context: dg.AssetExecutionContext, cache: RunCache, documents
     return result
 
 
-ALL_ASSETS = [documents, place_geocodes, doc_embeddings, image_analysis]
-CACHE_TABLES = {"place_geocodes": "geocode", "doc_embeddings": "embed", "image_analysis": "image"}
+ALL_ASSETS = [documents, place_geocodes, doc_embeddings, doc_embeddings_by_id, image_analysis]
+CACHE_TABLES = {
+    "place_geocodes": "geocode",
+    "doc_embeddings": "embed",
+    "doc_embeddings_by_id": "embed_by_id",
+    "image_analysis": "image",
+}
 
 defs = dg.Definitions(
     assets=ALL_ASSETS,
@@ -111,6 +142,7 @@ def run_demo(
             "ops": {
                 "documents": {"config": {"edition": edition, "size": size}},
                 "doc_embeddings": {"config": {"model": model}},
+                "doc_embeddings_by_id": {"config": {"model": model}},
             }
         },
     )

@@ -30,7 +30,7 @@ PLACES = [
 BASE_FILE_DATE = dt.date(2026, 1, 1)
 
 
-def _row(i: int, place: str, file_date: dt.date) -> dict[str, object]:
+def _row(i: int, place: str, date: dt.date) -> dict[str, object]:
     return {
         "doc_id": i,
         "title": f"Object {i}",
@@ -38,15 +38,16 @@ def _row(i: int, place: str, file_date: dt.date) -> dict[str, object]:
         "medium": MEDIA[i % len(MEDIA)],
         "place": place,
         "file_name": f"img_{i:05}.tif",
-        "file_date": file_date,
+        "file_date": date,
+        "modified": date,
     }
 
 
 def fake_documents(edition: int, size: int) -> pl.DataFrame:
     """Generate the source as it stands at ``edition``.
 
-    Each edition after the first retitles 10 documents, re-photographs 3 (a newer
-    ``file_date``), deletes 5, and adds 5 sharing one new place.
+    Each edition after the first retitles 10 documents (a newer ``modified``),
+    re-photographs 3 (a newer ``file_date``), deletes 5, and adds 5 sharing one new place.
     """
     rows = {i: _row(i, PLACES[i % len(PLACES)], BASE_FILE_DATE) for i in range(size)}
     for e in range(2, edition + 1):
@@ -54,6 +55,7 @@ def fake_documents(edition: int, size: int) -> pl.DataFrame:
         edited = BASE_FILE_DATE + dt.timedelta(days=e)
         for i in range(offset, offset + 10):
             rows[i]["title"] = f"Object {i} (revised in edition {e})"
+            rows[i]["modified"] = edited
         for i in range(offset + 50, offset + 53):
             rows[i]["file_date"] = edited
         for i in range(size - offset - 5, size - offset):

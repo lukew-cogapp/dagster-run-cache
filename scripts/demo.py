@@ -29,8 +29,8 @@ def main() -> None:
         print(f"\nRun {n}: {label}…", flush=True)
         started = time.perf_counter()
         for asset, (hits, misses) in run_demo(STORAGE, edition=edition, model=model).items():
-            print(f"  {asset:<16} hits {hits:>5}  misses {misses:>5}", flush=True)
-        print(f"  total time       {time.perf_counter() - started:.2f}s", flush=True)
+            print(f"  {asset:<21} hits {hits:>5}  misses {misses:>5}", flush=True)
+        print(f"  {'total time':<21} {time.perf_counter() - started:.2f}s", flush=True)
 
 
 if __name__ == "__main__":

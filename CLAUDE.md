@@ -74,13 +74,18 @@ These were argued through; don't reopen them without a new reason.
   cast raise and point at `clear`. Concurrent stores are last-writer-wins.
 - `fetch` returns a `LazyFrame`; on a table with no file it returns
   `frame.head(0)`, so `compute` on an empty first run returns empty.
+- `doc_embeddings` keys on the text and uses `compute`; `doc_embeddings_by_id`
+  keys on `doc_id` + `modified` and uses the three steps, because its `fn`
+  needs the text, which is not in the key (`compute` passes `fn` key columns
+  only). Both read `EmbedConfig.model`, so `run_demo` passes the model to both.
 - Demo assets return `LazyFrame` for the IO manager to sink. `run_demo` maps
   each asset to its table (`CACHE_TABLES`) to read the counts back.
 
 ## Demo scenario numbers
 
-`fake_documents` edition 2 retitles 10 documents, re-photographs 3, deletes 5,
-and adds 5 sharing one new place. The tests assert the resulting hit/miss
+`fake_documents` edition 2 retitles 10 documents (bumping `modified`),
+re-photographs 3 (bumping `file_date`), deletes 5, and adds 5 sharing one new
+place. The tests assert the resulting hit/miss
 counts per asset; changing the edition logic means updating `tests/test_demo.py`
 and the README output block together.
 
