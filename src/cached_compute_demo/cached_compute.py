@@ -47,11 +47,9 @@ def cached_compute(
     Args:
         context: The calling asset's context; its own key is the cache.
         current: Rows to produce results for. Keys absent from it drop out of the cache.
-        key: Columns identifying a row.
         inputs: Columns whose change invalidates a row's cached result.
         compute: Takes a batch of ``key`` + ``inputs`` rows, returns ``key`` + result columns.
         version: Bump to invalidate every row, e.g. on a model or logic change.
-        batch_size: Rows per ``compute`` call.
 
     """
     current = current.select(*key, *inputs).with_columns(input_hash(inputs, version))
@@ -63,13 +61,13 @@ def cached_compute(
 
     parts: list[pl.DataFrame] = []
     if prior is not None:
+        # Collected, not left lazy: prior scans the file the IO manager is about to overwrite.
         parts.append(prior.join(current.select(match_on), on=match_on, how="semi").collect())
     hits = parts[0].height if parts else 0
     for batch in misses.iter_slices(batch_size):
         result = compute(batch.drop(HASH_COLUMN))
         parts.append(result.join(batch.select(match_on), on=key, how="inner"))
 
-    # Collected rather than returned lazy: the prior part scans the very file the IO manager is about to overwrite.
     if parts:
         out = pl.concat(parts, how="diagonal_relaxed")
     else:
