@@ -16,20 +16,62 @@ flowchart LR
 
 ## API
 
+| Method | Does |
+|---|---|
+| `compute(table, frame, key, fn)` | runs `fn` on uncached keys only, stores the results, returns every row with its value |
+| `lookup(table, frame, key)` | finds the rows not cached yet, with hit and miss counts |
+| `store(table, frame, key)` | adds rows, replacing any with the same key |
+| `fetch(table, frame, key)` | joins the cached columns onto a frame |
+| `clear(table)` | deletes a table |
+
+The examples below share one cache and a stand-in geocoder:
+
 ```python
+import polars as pl
 from dagster_run_cache import RunCache
 
-# One call: compute only the uncached keys, return every row with its value.
-result, lookup = cache.compute("geocode", places, key="place", fn=geocode_batch)
-context.add_output_metadata(lookup.metadata)  # cache/geocode/hits, cache/geocode/misses
-return result  # a LazyFrame
+cache = RunCache(base_dir="output/cache")
+COORDS = {"Tokyo": (35.7, 139.7), "Paris": (48.9, 2.4), "Kyoto": (35.0, 135.8)}
 
-# The same in three steps, when you need control over the expensive call.
-lookup = cache.lookup("embed", docs, key=["model", "text"])
-cache.store("embed", embed(lookup.misses), key=["model", "text"])
-result = cache.fetch("embed", docs, key=["model", "text"])
 
-cache.clear("embed")  # drop one table
+def geocode(batch: pl.DataFrame) -> pl.DataFrame:
+    return batch.with_columns(
+        lat=pl.Series([COORDS[p][0] for p in batch["place"]]),
+        lon=pl.Series([COORDS[p][1] for p in batch["place"]]),
+    )
+```
+
+In a pipeline, register the resource once and request it by name:
+
+```python
+defs = dg.Definitions(assets=[...], resources={"cache": RunCache(base_dir="output/cache")})
+
+
+@dg.asset
+def place_geocodes(context, cache: RunCache, documents: pl.LazyFrame) -> pl.LazyFrame:
+    result, lookup = cache.compute("geocode", documents.select("place").unique(), key="place", fn=geocode)
+    context.add_output_metadata(lookup.metadata)
+    return result
+```
+
+### `compute`
+
+```python
+places = pl.DataFrame({"doc_id": [1, 2, 3], "place": ["Tokyo", "Paris", "Tokyo"]})
+result, lookup = cache.compute("geocode", places, key="place", fn=geocode)
+# geocode is called once, with ["Tokyo", "Paris"]
+
+result.collect()
+# doc_id  place  lat   lon
+# 1       Tokyo  35.7  139.7
+# 2       Paris  48.9  2.4
+# 3       Tokyo  35.7  139.7
+
+lookup.hit_count, lookup.miss_count  # (0, 2)
+
+result, lookup = cache.compute("geocode", pl.DataFrame({"place": ["Tokyo", "Kyoto"]}), key="place", fn=geocode)
+# geocode is called with ["Kyoto"] only
+lookup.hit_count, lookup.miss_count  # (1, 1)
 ```
 
 `fn` receives the uncached keys, one row each, with only the key columns. It
@@ -37,21 +79,54 @@ returns those keys plus the columns to cache, as typed Polars columns (a vector
 stays `Array(Float32, n)`). `compute` raises if `fn` leaves out a key or a key
 column, or returns a column the input already has.
 
-Pass `batch_size` to `compute` for long jobs. Each batch is stored as it
-finishes, so a first run that fails at row 140,000 keeps what it finished.
-Keep batches in the thousands, since every store rewrites the file.
+The counts are distinct keys, not rows: Tokyo appears twice above but is one
+miss.
 
-`lookup.hit_count` and `lookup.miss_count` count distinct keys, not rows: five
-documents sharing a place are one geocode.
-
-Register the resource once and request it by name in any asset:
+Pass `batch_size` for long jobs. Each batch is stored as it finishes, so a
+first run that fails at row 140,000 keeps what it finished. Keep batches in the
+thousands, since every store rewrites the file.
 
 ```python
-defs = dg.Definitions(assets=[...], resources={"cache": RunCache(base_dir="output/cache")})
+result, lookup = cache.compute("geocode", places, key="place", fn=geocode, batch_size=5_000)
+```
 
+### `lookup`
 
-@dg.asset
-def place_geocodes(context, cache: RunCache, documents: pl.LazyFrame) -> pl.LazyFrame: ...
+```python
+lookup = cache.lookup("geocode", pl.DataFrame({"place": ["Tokyo", "Lima"]}), key="place")
+
+lookup.misses  # place: ["Lima"]
+lookup.metadata  # {"cache/geocode/hits": 1, "cache/geocode/misses": 1}
+```
+
+`lookup.misses` keeps every column of the input, not only the key. Use it with
+`store` and `fetch` when `fn` needs columns that are not in the key (see
+`embed_by_id` under Keys), or when you want to call the expensive service
+yourself.
+
+### `store`
+
+```python
+cache.store("geocode", pl.DataFrame({"place": ["Lima"], "lat": [-12.0], "lon": [-77.0]}), key="place")
+```
+
+A row whose key is already cached replaces the old one. The columns must match
+what the table already holds; see Limits.
+
+### `fetch`
+
+```python
+cache.fetch("geocode", pl.DataFrame({"place": ["Lima", "Oslo"]}), key="place").collect()
+# place  lat    lon
+# Lima   -12.0  -77.0
+```
+
+Oslo is not cached, so it drops out. `fetch` returns a `LazyFrame`.
+
+### `clear`
+
+```python
+cache.clear("geocode")  # 4, the rows it held
 ```
 
 ### Keys
