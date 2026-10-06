@@ -29,11 +29,16 @@ venv's scripts hold absolute paths.
 
 ## Layout
 
-- `src/dagster_run_cache/utils/cache.py`: the reusable part. No demo code
+- `src/dagster_run_cache/utils/cache.py`: the `RunCache` resource, plus
+  `find_misses` and `merge_rows`, the logic both approaches share. No demo code
   belongs under `utils/`. The package root re-exports `RunCache` and `Lookup`.
+- `src/dagster_run_cache/utils/cached_io_manager.py`: `CachedParquetIOManager`
+  (subclasses dagster-polars' `PolarsParquetIOManager`, overrides only
+  `dump_to_path` to merge instead of replace) and `uncached(context, frame)`.
 - `src/dagster_run_cache/fakes.py`: fake source (`fake_documents(edition, size)`)
   and fake slow endpoints that sleep to stand in for latency.
-- `src/dagster_run_cache/defs.py`: the four demo assets, the `Definitions`,
+- `src/dagster_run_cache/defs.py`: the demo assets (four on the resource, two
+  on the IO manager), the `Definitions`,
   and `run_demo`, which both `scripts/demo.py` and `tests/test_demo.py` call.
 
 ## Design decisions the user made
@@ -54,6 +59,9 @@ These were argued through; don't reopen them without a new reason.
   `cache/<table>/misses`, and `compute` returns `(LazyFrame, Lookup)`.
 - **Called "table", not "prefix"**, so it is not confused with a Dagster
   asset-key prefix.
+- **Two packagings, compared side by side:** the resource, and an IO manager
+  version suggested by a collection-flow maintainer. The README's "As an IO
+  manager instead" table is the comparison; neither replaces the other yet.
 - **Not yet done, by choice:** S3/UPath paths, an asset-check factory and
   Pandera schemas. They block upstreaming into collection-flow, not this repo;
   FAMSF reads S3 through an NFS mount.
@@ -77,6 +85,12 @@ These were argued through; don't reopen them without a new reason.
   keys on `doc_id` + `modified` and uses the three steps, because its `fn`
   needs the text, which is not in the key (`compute` passes `fn` key columns
   only). Both read `EmbedConfig.model`, so `run_demo` passes the model to both.
+- The IO-manager cache asset declares `metadata={"cache_key": [...]}`, calls
+  `uncached` (which self-loads via `context.load_asset_value`) and returns only
+  new rows. `dump_to_path` merges them into the stored file through a temp file
+  and `UPath.rename`, writes nothing when no row is new, and adds
+  `cache/rows_stored` metadata. It reads `_remap_fsspec_storage_options` from
+  dagster-polars, a private helper, to scan with the same storage options.
 - Demo assets return `LazyFrame` for the IO manager to sink. `run_demo` maps
   each asset to its table (`CACHE_TABLES`) to read the counts back.
 

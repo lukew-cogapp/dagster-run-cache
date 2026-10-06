@@ -20,6 +20,7 @@ def test_first_run_computes_everything(tmp_path: Path) -> None:
         "place_geocodes": (0, 12),
         "doc_embeddings": (0, 100),
         "doc_embeddings_by_id": (0, 100),
+        "embedding_cache": (0, 100),
         "image_analysis": (0, 100),
     }
 
@@ -32,6 +33,7 @@ def test_unchanged_rerun_computes_nothing(tmp_path: Path) -> None:
         "place_geocodes": (12, 0),
         "doc_embeddings": (100, 0),
         "doc_embeddings_by_id": (100, 0),
+        "embedding_cache": (100, 0),
         "image_analysis": (100, 0),
     }
     assert _embeddings(tmp_path).equals(before)
@@ -44,6 +46,7 @@ def test_edits_recompute_only_affected_keys(tmp_path: Path) -> None:
         "place_geocodes": (12, 1),  # the new place
         "doc_embeddings": (85, 15),  # 10 retitled + 5 added
         "doc_embeddings_by_id": (85, 15),  # the same 15 carry a newer modified date
+        "embedding_cache": (85, 15),
         "image_analysis": (92, 8),  # 3 re-photographed + 5 added
     }
 
@@ -67,6 +70,7 @@ def test_model_bump_invalidates_only_embeddings(tmp_path: Path) -> None:
         "place_geocodes": (12, 0),
         "doc_embeddings": (0, 100),
         "doc_embeddings_by_id": (0, 100),
+        "embedding_cache": (0, 100),
         "image_analysis": (100, 0),
     }
 
@@ -83,3 +87,11 @@ def test_id_key_gives_the_same_vectors_without_storing_text(tmp_path: Path) -> N
         "modified",
         "vector",
     }
+
+
+def test_io_manager_version_gives_the_same_vectors(tmp_path: Path) -> None:
+    """The IO-manager cache and the join downstream of it reproduce the resource version's output."""
+    _run(tmp_path)
+    _run(tmp_path, edition=2)
+    via_io = pl.read_parquet(tmp_path / "doc_embeddings_via_io.parquet").sort("doc_id")
+    assert via_io.equals(_embeddings(tmp_path))

@@ -7,6 +7,7 @@ import polars as pl
 from dagster_polars import PolarsParquetIOManager
 
 from dagster_run_cache import RunCache, fakes
+from dagster_run_cache.utils.cached_io_manager import CachedParquetIOManager, uncached
 
 EMBED_BATCH_SIZE = 100
 VECTOR = pl.Array(pl.Float32, fakes.EMBED_DIM)
@@ -47,7 +48,7 @@ def place_geocodes(context: dg.AssetExecutionContext, cache: RunCache, documents
 
 
 def _embed(batch: pl.DataFrame) -> pl.DataFrame:
-    vectors = fakes.embed_endpoint(batch["text"].to_list(), batch["model"][0])
+    vectors = fakes.embed_endpoint(batch["text"].to_list(), batch["model"][0] if batch.height else "")
     return batch.with_columns(pl.Series("vector", vectors, dtype=VECTOR))
 
 
@@ -97,6 +98,26 @@ def doc_embeddings_by_id(
     return cache.fetch("embed_by_id", docs.select(key), key=key).select("doc_id", "vector").sort("doc_id")
 
 
+@dg.asset(io_manager_key="cached_io_manager", metadata={"cache_key": ["model", "text"]})
+def embedding_cache(context: dg.AssetExecutionContext, config: EmbedConfig, documents: pl.LazyFrame) -> pl.DataFrame:
+    """Every vector this asset has embedded, kept by ``CachedParquetIOManager``.
+
+    Returns only this run's new vectors; the IO manager merges them into the stored table.
+    """
+    lookup = uncached(context, _embedding_text(documents, config.model).select("model", "text"))
+    context.add_output_metadata(lookup.metadata)
+    keys = lookup.misses.unique(maintain_order=True)
+    batches = [_embed(batch) for batch in keys.iter_slices(EMBED_BATCH_SIZE)]
+    return pl.concat(batches) if batches else _embed(keys)
+
+
+@dg.asset
+def doc_embeddings_via_io(config: EmbedConfig, documents: pl.LazyFrame, embedding_cache: pl.LazyFrame) -> pl.LazyFrame:
+    """One vector per current document, joined from ``embedding_cache``."""
+    docs = _embedding_text(documents, config.model)
+    return docs.join(embedding_cache, on=["model", "text"]).select("doc_id", "vector").sort("doc_id")
+
+
 def _analyse(batch: pl.DataFrame) -> pl.DataFrame:
     results = [fakes.analyse_image(name, date) for name, date in batch.iter_rows()]
     return batch.with_columns(pl.DataFrame(results))
@@ -111,11 +132,20 @@ def image_analysis(context: dg.AssetExecutionContext, cache: RunCache, documents
     return result
 
 
-ALL_ASSETS = [documents, place_geocodes, doc_embeddings, doc_embeddings_by_id, image_analysis]
+ALL_ASSETS = [
+    documents,
+    place_geocodes,
+    doc_embeddings,
+    doc_embeddings_by_id,
+    embedding_cache,
+    doc_embeddings_via_io,
+    image_analysis,
+]
 CACHE_TABLES = {
     "place_geocodes": "geocode",
     "doc_embeddings": "embed",
     "doc_embeddings_by_id": "embed_by_id",
+    "embedding_cache": "embedding_cache",
     "image_analysis": "image",
 }
 
@@ -124,6 +154,7 @@ defs = dg.Definitions(
     resources={
         "io_manager": PolarsParquetIOManager(base_dir="output"),
         "cache": RunCache(base_dir="output/cache"),
+        "cached_io_manager": CachedParquetIOManager(base_dir="output"),
     },
 )
 
@@ -137,12 +168,15 @@ def run_demo(
         resources={
             "io_manager": PolarsParquetIOManager(base_dir=str(storage)),
             "cache": RunCache(base_dir=str(storage / "cache")),
+            "cached_io_manager": CachedParquetIOManager(base_dir=str(storage)),
         },
         run_config={
             "ops": {
                 "documents": {"config": {"edition": edition, "size": size}},
                 "doc_embeddings": {"config": {"model": model}},
                 "doc_embeddings_by_id": {"config": {"model": model}},
+                "embedding_cache": {"config": {"model": model}},
+                "doc_embeddings_via_io": {"config": {"model": model}},
             }
         },
     )
