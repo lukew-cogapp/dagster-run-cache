@@ -1,15 +1,11 @@
-"""Demo assets: a fake document source and an embedding asset cached with ``cached_compute``."""
-
-import hashlib
-import time
+"""Demo assets: one fake source and three ways of caching expensive work against it."""
 
 import dagster as dg
 import polars as pl
+from dagster_polars import PolarsParquetIOManager
 
+from cached_compute_demo import fakes
 from cached_compute_demo.cached_compute import cached_compute
-
-EMBED_DIM = 8
-EMBED_SECONDS_PER_ROW = 0.002
 
 
 class SourceConfig(dg.Config):
@@ -19,53 +15,82 @@ class SourceConfig(dg.Config):
     size: int = 1_000
 
 
-def fake_documents(edition: int, size: int) -> pl.DataFrame:
-    """Generate the source as it stands at ``edition``.
-
-    Each edition after the first retitles 10 documents, deletes 5 and adds 5.
-    """
-    ids = list(range(size))
-    titles = {i: f"Object {i}" for i in ids}
-    for e in range(2, edition + 1):
-        offset = (e - 2) * 10
-        for i in range(offset, offset + 10):
-            titles[i] = f"Object {i} (revised in edition {e})"
-        for i in range(size - offset - 5, size - offset):
-            titles.pop(i, None)
-        for i in range(size + offset, size + offset + 5):
-            titles[i] = f"Object {i}"
-    return pl.DataFrame({"doc_id": list(titles), "title": list(titles.values())})
-
-
-def fake_embed(texts: pl.Series) -> pl.Series:
-    """Deterministic stand-in for a model call, slow enough per row that a cache hit is visible."""
-    time.sleep(EMBED_SECONDS_PER_ROW * len(texts))
-    vectors = [[b / 255 for b in hashlib.sha256(t.encode()).digest()[:EMBED_DIM]] for t in texts]
-    return pl.Series("vector", vectors, dtype=pl.Array(pl.Float32, EMBED_DIM))
-
-
 class EmbedConfig(dg.Config):
     """Embedding model version; changing it invalidates every cached vector."""
 
-    version: str = "fake-embed-v1"
+    model: str = "fake-embed-v1"
 
 
 @dg.asset
 def documents(config: SourceConfig) -> pl.DataFrame:
-    """Serve the fake upstream source at the configured edition."""
-    return fake_documents(config.edition, config.size)
+    """Fake upstream source documents."""
+    return fakes.fake_documents(config.edition, config.size)
+
+
+def _embed_batch(batch: pl.DataFrame, model: str) -> pl.DataFrame:
+    texts = batch.select(pl.concat_str("title", "artist", "medium", separator=". "))
+    vectors = fakes.embed_endpoint(texts.to_series().to_list(), model)
+    return batch.select("doc_id", pl.Series("vector", vectors, dtype=pl.Array(pl.Float32, fakes.EMBED_DIM)))
 
 
 @dg.asset
 def doc_embeddings(
     context: dg.AssetExecutionContext, config: EmbedConfig, documents: pl.LazyFrame
 ) -> dg.Output[pl.DataFrame]:
-    """One vector per document, embedding only documents whose title changed since the last run."""
+    """One vector per document from a batched embedding endpoint."""
     return cached_compute(
         context,
         documents,
         key=["doc_id"],
-        inputs=["title"],
-        compute=lambda batch: batch.select("doc_id", fake_embed(batch["title"])),
-        version=config.version,
+        inputs=["title", "artist", "medium"],
+        compute=lambda batch: _embed_batch(batch, config.model),
+        version=config.model,
+        batch_size=100,
     )
+
+
+def _geocode_batch(batch: pl.DataFrame) -> pl.DataFrame:
+    coords = [fakes.geocode_endpoint(p) for p in batch["place"]]
+    return batch.select("place").with_columns(
+        lat=pl.Series([c[0] for c in coords]),
+        lon=pl.Series([c[1] for c in coords]),
+    )
+
+
+@dg.asset
+def place_geocodes(context: dg.AssetExecutionContext, documents: pl.LazyFrame) -> dg.Output[pl.DataFrame]:
+    """Coordinates per distinct place, so a place shared by many documents is looked up once."""
+    return cached_compute(
+        context,
+        documents.select("place").unique(),
+        key=["place"],
+        inputs=[],
+        compute=_geocode_batch,
+        version="fake-geocoder-v1",
+    )
+
+
+def _analyse_batch(batch: pl.DataFrame) -> pl.DataFrame:
+    results = [fakes.analyse_image(f, d) for f, d in batch.select("file_name", "file_date").iter_rows()]
+    return batch.select("file_name").with_columns(pl.DataFrame(results))
+
+
+@dg.asset
+def image_analysis(context: dg.AssetExecutionContext, documents: pl.LazyFrame) -> dg.Output[pl.DataFrame]:
+    """Dimensions and dominant colour per image file, redone only when the file is replaced."""
+    return cached_compute(
+        context,
+        documents.select("file_name", "file_date").unique(),
+        key=["file_name"],
+        inputs=["file_date"],
+        compute=_analyse_batch,
+        version="fake-analyser-v1",
+    )
+
+
+ALL_ASSETS = [documents, doc_embeddings, place_geocodes, image_analysis]
+
+defs = dg.Definitions(
+    assets=ALL_ASSETS,
+    resources={"io_manager": PolarsParquetIOManager(base_dir="output")},
+)

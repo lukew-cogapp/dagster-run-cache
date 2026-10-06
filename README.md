@@ -37,6 +37,17 @@ def doc_embeddings(context, documents: pl.LazyFrame):
 
 ## Demo
 
+Three assets share the one helper, each caching a different kind of expensive
+work against the same fake source (`src/cached_compute_demo/defs.py`):
+
+| Asset | Expensive call | Key | Recomputed when |
+|---|---|---|---|
+| `doc_embeddings` | batched embedding endpoint | `doc_id` | title, artist or medium changes, or the model version is bumped |
+| `place_geocodes` | geocoder, one call per place | place string | a new place appears; places shared by many documents are looked up once |
+| `image_analysis` | image decode | `file_name` | the file's `file_date` moves on (re-photographed) |
+
+The services are fakes in `fakes.py` that sleep to stand in for latency.
+
 ```sh
 uv sync
 uv run python scripts/demo.py
@@ -47,13 +58,34 @@ instance, so only the Parquet on disk carries over:
 
 ```
 Run 1: first run, empty cache…
-  hits     0  misses  1000  rows  1000   2.51s
+  doc_embeddings   hits     0  misses  1000
+  place_geocodes   hits     0  misses    12
+  image_analysis   hits     0  misses  1000
+  total time       7.46s
+
 Run 2: nothing changed…
-  hits  1000  misses     0  rows  1000   0.15s
-Run 3: source edited: 10 retitled, 5 deleted, 5 added…
-  hits   985  misses    15  rows  1000   0.17s
+  doc_embeddings   hits  1000  misses     0
+  place_geocodes   hits    12  misses     0
+  image_analysis   hits  1000  misses     0
+  total time       0.30s
+
+Run 3: source edited: 10 retitled, 3 re-photographed, 5 deleted, 5 added in a new place…
+  doc_embeddings   hits   985  misses    15
+  place_geocodes   hits    12  misses     1
+  image_analysis   hits   992  misses     8
+  total time       0.42s
+
 Run 4: embedding model bumped…
-  hits     0  misses  1000  rows  1000   2.16s
+  doc_embeddings   hits     0  misses  1000
+  place_geocodes   hits    13  misses     0
+  image_analysis   hits  1000  misses     0
+  total time       2.37s
+```
+
+To browse the assets in the Dagster UI instead:
+
+```sh
+uv run dagster dev -m cached_compute_demo.defs
 ```
 
 ## Limits
