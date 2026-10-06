@@ -6,9 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `RunCache`, a Dagster resource that caches computed rows between runs: one
 Parquet file per table, keyed by one or more columns, with `compute`,
-`lookup`, `store`, `fetch` and `clear`. Plus a demo pipeline
-that exercises it. The README covers the API, key choice and limits; read it
-first.
+`lookup`, `store`, `fetch` and `clear`. Plus a demo pipeline that exercises
+it. The README covers the API, key choice and limits; read it first.
 
 ## Commands
 
@@ -31,10 +30,10 @@ venv's scripts hold absolute paths.
 ## Layout
 
 - `src/dagster_run_cache/utils/cache.py`: the reusable part. No demo code
-  belongs under `utils/`. The package root re-exports `RunCache`.
+  belongs under `utils/`. The package root re-exports `RunCache` and `Lookup`.
 - `src/dagster_run_cache/fakes.py`: fake source (`fake_documents(edition, size)`)
   and fake slow endpoints that sleep to stand in for latency.
-- `src/dagster_run_cache/defs.py`: the three demo assets, the `Definitions`,
+- `src/dagster_run_cache/defs.py`: the four demo assets, the `Definitions`,
   and `run_demo`, which both `scripts/demo.py` and `tests/test_demo.py` call.
 
 ## Design decisions the user made
@@ -85,9 +84,9 @@ These were argued through; don't reopen them without a new reason.
 
 `fake_documents` edition 2 retitles 10 documents (bumping `modified`),
 re-photographs 3 (bumping `file_date`), deletes 5, and adds 5 sharing one new
-place. The tests assert the resulting hit/miss
-counts per asset; changing the edition logic means updating `tests/test_demo.py`
-and the README output block together.
+place. The tests assert the resulting hit/miss counts per asset; changing the
+edition logic means updating `tests/test_demo.py` and the README output block
+together.
 
 ## Constraints
 

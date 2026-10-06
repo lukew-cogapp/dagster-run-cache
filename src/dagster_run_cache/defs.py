@@ -1,4 +1,4 @@
-"""Demo assets: one fake source and three expensive steps cached against it with ``RunCache``."""
+"""Demo assets: one fake source and four cached assets built from it with ``RunCache``."""
 
 from pathlib import Path
 
