@@ -66,6 +66,45 @@ def _reject_null_keys(table: str, null_counts: pl.DataFrame) -> None:
         raise ValueError(f"Key column(s) {bad} hold nulls; table {table!r} cannot cache a null key")
 
 
+def find_misses(table: str, frame: Frame, key: Key, stored: pl.LazyFrame | None) -> Lookup:
+    """Split ``frame`` against the ``stored`` rows of ``table`` (``None`` when nothing is stored yet).
+
+    The misses are collected, since they are what goes to the expensive call.
+    """
+    rows = frame.lazy()
+    misses_lf = rows if stored is None else rows.join(stored.select(key), on=key, how="anti")
+    distinct = rows.select(key).unique().select(pl.len())
+    misses, total, nulls = pl.collect_all([misses_lf, distinct, _null_counts(rows, key)])
+    _reject_null_keys(table, nulls)
+    miss_count = misses.select(key).n_unique()
+    return Lookup(table, misses, hit_count=total.item() - miss_count, miss_count=miss_count)
+
+
+def merge_rows(table: str, frame: Frame, key: Key, stored: pl.LazyFrame | None) -> pl.LazyFrame | None:
+    """Return ``stored`` with ``frame``'s rows added, replacing rows that share a key; ``None`` if nothing is new.
+
+    The new rows are aligned to the stored schema (column order, then a strict cast), so
+    compatible drift is absorbed and anything else raises.
+    """
+    new = frame.lazy().unique(key, keep="last", maintain_order=True).collect()
+    if new.is_empty() and stored is not None:
+        return None
+    _reject_null_keys(table, _null_counts(new.lazy(), key).collect())
+    if stored is None:
+        return new.lazy()
+    schema = stored.collect_schema()
+    if set(schema.names()) != set(new.columns):
+        raise ValueError(
+            f"Table {table!r} holds columns {sorted(schema.names())}, not {sorted(new.columns)}; "
+            "clear it to start afresh"
+        )
+    try:
+        rows = new.select(schema.names()).cast(schema).lazy()
+    except pl.exceptions.InvalidOperationError as e:
+        raise ValueError(f"Rows do not fit the dtypes stored in table {table!r}: {dict(schema)}") from e
+    return pl.concat([stored.join(rows.select(key), on=key, how="anti"), rows])
+
+
 class RunCache(dg.ConfigurableResource):  # type: ignore[type-arg]
     """Computed rows shared by every run pointing at the same ``base_dir``, one file per table."""
 
@@ -97,21 +136,8 @@ class RunCache(dg.ConfigurableResource):  # type: ignore[type-arg]
         return self.fetch(table, frame, key), lookup
 
     def lookup(self, table: str, frame: Frame, key: Key) -> Lookup:
-        """Find the rows of ``frame`` whose key is not cached in ``table``.
-
-        The misses are collected, since they are what goes to the expensive call.
-        """
-        rows = frame.lazy()
-        path = self._path(table)
-        if path.exists():
-            misses_lf = rows.join(pl.scan_parquet(path).select(key), on=key, how="anti")
-        else:
-            misses_lf = rows
-        distinct = rows.select(key).unique().select(pl.len())
-        misses, total, nulls = pl.collect_all([misses_lf, distinct, _null_counts(rows, key)])
-        _reject_null_keys(table, nulls)
-        miss_count = misses.select(key).n_unique()
-        return Lookup(table, misses, hit_count=total.item() - miss_count, miss_count=miss_count)
+        """Find the rows of ``frame`` whose key is not cached in ``table``; the misses are collected."""
+        return find_misses(table, frame, key, self._stored(table))
 
     def store(self, table: str, frame: Frame, key: Key) -> None:
         """Add ``frame``'s rows to ``table``, replacing rows that share a key.
@@ -120,25 +146,10 @@ class RunCache(dg.ConfigurableResource):  # type: ignore[type-arg]
         Two runs storing at once both succeed, but the later one drops the other's
         new rows, which costs a recompute rather than a corrupt cache.
         """
-        new = frame.lazy().unique(key, keep="last", maintain_order=True).collect()
-        if new.is_empty():
+        rows = merge_rows(table, frame, key, self._stored(table))
+        if rows is None:
             return
-        _reject_null_keys(table, _null_counts(new.lazy(), key).collect())
-        path = self._path(table)
-        rows = new.lazy()
-        if path.exists():
-            stored = pl.read_parquet_schema(path)
-            if set(stored) != set(new.columns):
-                raise ValueError(
-                    f"Table {table!r} holds columns {sorted(stored)}, not {sorted(new.columns)}; "
-                    f"call clear({table!r}) to start afresh"
-                )
-            try:
-                rows = new.select(list(stored)).cast(pl.Schema(stored)).lazy()
-            except pl.exceptions.InvalidOperationError as e:
-                raise ValueError(f"Rows do not fit the dtypes stored in table {table!r}: {stored}") from e
-            rows = pl.concat([pl.scan_parquet(path).join(rows.select(key), on=key, how="anti"), rows])
-        with _atomic_write(path) as tmp:
+        with _atomic_write(self._path(table)) as tmp:
             rows.sink_parquet(tmp)
 
     def fetch(self, table: str, frame: Frame, key: Key) -> pl.LazyFrame:
@@ -171,6 +182,10 @@ class RunCache(dg.ConfigurableResource):  # type: ignore[type-arg]
                 f"fn for table {table!r} returned no row for {dropped.height} of {batch.height} keys, "
                 f"e.g. {dropped.row(0, named=True)}"
             )
+
+    def _stored(self, table: str) -> pl.LazyFrame | None:
+        path = self._path(table)
+        return pl.scan_parquet(path) if path.exists() else None
 
     def _path(self, table: str) -> Path:
         if not _TABLE_NAME.fullmatch(table):
